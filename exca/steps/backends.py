@@ -591,7 +591,9 @@ class Backend(exca.helpers.DiscriminatedModel, discriminator_key="backend"):
         upstream = tuple(batch._upstream) + tuple(step._uid_steps())
         paths = step._make_paths(upstream)
         if paths.step_folder not in self._checked_configs:
-            identity.write_configs(paths.step_folder, upstream)
+            # 0o777 matches the cache data files (see _cache_dict) so the step
+            # config yamls don't become the sole write-blocker on a shared cache.
+            identity.write_configs(paths.step_folder, upstream, permissions=0o777)
             self._checked_configs.add(paths.step_folder)
         cd = self._cache_dict(paths.cache_folder, cache_type=paths.cache_type)
         mode = _fold_modes(batch._mode, _effective_mode(step))

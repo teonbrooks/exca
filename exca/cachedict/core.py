@@ -30,6 +30,59 @@ X = tp.TypeVar("X")
 logger = logging.getLogger(__name__)
 METADATA_TAG = "metadata="
 
+# -- Cache-access observation -------------------------------------------------
+# Observers registered via :func:`observe_access` are notified with the folder
+# of every :class:`CacheDict` that is constructed or read/written/checked while
+# their scope is active.  This lets callers record, by observation, the exact
+# set of cache folders a computation depends on without reaching into private
+# internals or monkeypatching ``CacheDict``.
+_access_observers: list[tp.Callable[[Path], None]] = []
+_observers_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def observe_access(
+    callback: tp.Callable[[Path], None],
+) -> tp.Iterator[tp.Callable[[Path], None]]:
+    """Notify *callback* of every ``CacheDict`` folder touched within this scope.
+
+    *callback* is called with the ``folder`` of each :class:`CacheDict` as it is
+    constructed or has its contents accessed (``keys``/``__getitem__``/
+    ``__setitem__``/``__contains__``) for the duration of the ``with`` block.
+    Observation is process-wide (it sees every ``CacheDict``, not only ones the
+    caller created) and nested scopes each receive their own notifications.
+
+    Callbacks must be cheap and must not raise; any exception they raise is
+    caught and logged at debug level so observation never breaks caching. The
+    same callback is invoked from whichever thread touches the cache (exca reads
+    info files from a thread pool), so callbacks must be thread-safe.
+
+    Yields the *callback* so it can be used as ``with observe_access(cb):``.
+    """
+    with _observers_lock:
+        _access_observers.append(callback)
+    try:
+        yield callback
+    finally:
+        with _observers_lock:
+            try:
+                _access_observers.remove(callback)
+            except ValueError:
+                pass
+
+
+def _notify_access(folder: Path | None) -> None:
+    """Notify active :func:`observe_access` callbacks of a touched *folder*."""
+    if folder is None or not _access_observers:
+        return
+    with _observers_lock:
+        observers = list(_access_observers)
+    for callback in observers:
+        try:
+            callback(folder)
+        except Exception:  # observation must never break caching
+            logger.debug("cache-access observer failed", exc_info=True)
+
 
 @dataclasses.dataclass
 class DumpInfo:
@@ -144,6 +197,7 @@ class CacheDict(tp.Generic[X]):
         if self.folder is not None:
             self._dumper = DumpContext(self.folder, permissions=self.permissions)
         self._local = threading.local()  # per-thread write context, see _write_ctx
+        _notify_access(self.folder)
 
     def __repr__(self) -> str:
         name = self.__class__.__name__
@@ -181,6 +235,7 @@ class CacheDict(tp.Generic[X]):
     def keys(self) -> tp.Iterator[str]:
         """Returns the keys in the dictionary
         (triggers a cache folder reading if folder is not None)"""
+        _notify_access(self.folder)
         self._read_info_files()
         keys = set(self._ram_data) | set(self._key_info)
         return iter(keys)
@@ -271,6 +326,7 @@ class CacheDict(tp.Generic[X]):
             yield key, self[key]
 
     def __getitem__(self, key: str) -> X:
+        _notify_access(self.folder)
         if self._keep_in_ram:
             if key in self._ram_data or self.folder is None:
                 return self._ram_data[key]
@@ -284,6 +340,39 @@ class CacheDict(tp.Generic[X]):
         if self._keep_in_ram:
             self._ram_data[key] = loaded
         return loaded  # type: ignore
+
+    def filepath(self, key: str) -> Path:
+        """Absolute path of the file (or directory) backing *key* on disk.
+
+        Indexing a ``CacheDict`` returns the *loaded value*; this returns the
+        path the value was dumped to instead, for the common case of
+        one-file-per-entry handlers (parquet/npy/pickle dumps, directory
+        entries, ...).  Triggers a cache-folder read if *key* has not been
+        loaded yet.
+
+        Raises
+        ------
+        RuntimeError
+            if this cache is RAM-only (``folder is None``).
+        KeyError
+            if *key* is not present in the cache.
+        ValueError
+            if *key*'s entry is not backed by a single file/directory (its
+            info record carries no ``filename``, e.g. an inline JSON value).
+        """
+        if self.folder is None:
+            raise RuntimeError("filepath requires a folder-backed CacheDict")
+        if key not in self._key_info:
+            _ = self.keys()  # reload keys from disk
+        if key not in self._key_info:
+            raise KeyError(key)
+        filename = self._key_info[key].content.get("filename")
+        if filename is None:
+            raise ValueError(
+                f"Entry {key!r} is not backed by a single file "
+                "(no 'filename' in its cache info)"
+            )
+        return (self.folder / filename).resolve()
 
     # Thread-local write context: each thread gets its own DumpContext
     # (and thus its own JSONL file), enabling concurrent writers.
@@ -325,6 +414,7 @@ class CacheDict(tp.Generic[X]):
             yield self
 
     def __setitem__(self, key: str, value: X) -> None:
+        _notify_access(self.folder)
         if not isinstance(key, str):
             raise TypeError(f"Non-string keys are not allowed (got {key!r})")
         if self.folder is not None and self._write_ctx is None:
@@ -368,6 +458,7 @@ class CacheDict(tp.Generic[X]):
             self._dumper.delete(info.content)
 
     def __contains__(self, key: str) -> bool:
+        _notify_access(self.folder)
         # in-memory cache
         if key in self._ram_data:
             return True

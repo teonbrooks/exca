@@ -709,11 +709,18 @@ class ConfigDump:
     def _error(self, msg: str) -> RuntimeError:
         return RuntimeError(f"{msg}\n\n(this is for object: {self.model!r})")
 
-    def check_and_write(self, folder: Path, *, write: bool = True) -> None:
+    def check_and_write(
+        self, folder: Path, *, write: bool = True, permissions: int | None = None
+    ) -> None:
         """Check config consistency and optionally write files.
 
         Raises RuntimeError if uid.yaml doesn't match (cache collision)
         or defaults changed incompatibly.
+
+        When *permissions* is set, the config yaml files are chmod-ed to it
+        (best-effort) after writing, so they match the permissions applied to
+        the cache data files (e.g. ``0o777`` on a shared multi-user cache;
+        ``Path.write_text`` alone tops out at the umask-masked ``0o666``).
         """
         from .confdict import ConfDict  # avoid circular import
 
@@ -783,3 +790,13 @@ class ConfigDump:
                         continue
                 with temporary_save_path(fp) as tmp:
                     Path(tmp).write_text(self._to_yaml(name), encoding="utf8")
+            if permissions is not None:
+                for name in ("uid", "full-uid", "config"):
+                    fp = folder / f"{name}.yaml"
+                    if not fp.exists():
+                        continue
+                    try:
+                        fp.chmod(permissions)
+                    except OSError as e:  # best-effort: not fatal for a shared dir
+                        msg = "Failed to set permissions %o on '%s': %s"
+                        logger.warning(msg, permissions, fp, e)
